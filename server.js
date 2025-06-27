@@ -1,70 +1,71 @@
 const express = require('express');
 const dns = require('dns').promises;
 const SMTPConnection = require('smtp-connection');
+const tls = require('tls');
 const cors = require('cors');
 const LRU = require('lru-cache');
 
 const app = express();
 app.use(cors(), express.json());
 
-const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 }); // 1 hour cache
+const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 }); // cache for 1 hour
 
 function isValidFormat(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-async function hasMX(domain) {
+async function getMXRecords(domain) {
   try {
     const mxRecords = await dns.resolveMx(domain);
-    // Sort by priority ascending
     return mxRecords.length ? mxRecords.sort((a, b) => a.priority - b.priority) : [];
   } catch (err) {
-    console.error(`MX lookup error for domain "${domain}":`, err.message);
+    console.error(`MX lookup error for ${domain}:`, err.message);
     return [];
   }
 }
 
-function smtpVerifySingle(email, mxHost, port, useTLS) {
+function smtpVerify(email, mxHost, port, useTLS, timeout = 10000) {
   return new Promise((resolve) => {
-    const conn = new SMTPConnection({
+    const options = {
       host: mxHost,
       port,
       secure: false,
-      tls: useTLS ? { rejectUnauthorized: false } : undefined,
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 10000,
-    });
+      connectionTimeout: timeout,
+      greetingTimeout: timeout,
+      socketTimeout: timeout,
+    };
+    if (useTLS) {
+      options.tls = { rejectUnauthorized: false };
+    }
 
-    let resolved = false;
+    const connection = new SMTPConnection(options);
+    let done = false;
 
-    conn.on('error', (e) => {
-      if (!resolved) {
-        // console.error(`SMTP error on ${mxHost}:${port} (TLS: ${useTLS}):`, e.message);
-        resolved = true;
-        resolve({ success: false, error: e.message });
+    connection.on('error', (err) => {
+      if (!done) {
+        done = true;
+        // console.error(`SMTP error ${mxHost}:${port} TLS:${useTLS} - ${err.message}`);
+        resolve({ success: false, error: err.message });
       }
     });
 
-    conn.connect(() => {
-      conn.login({}, (loginErr) => {
+    connection.connect(() => {
+      connection.login({}, (loginErr) => {
         if (loginErr) {
-          conn.quit();
-          if (!resolved) {
-            resolved = true;
+          connection.quit();
+          if (!done) {
+            done = true;
             resolve({ success: false, error: loginErr.message });
           }
           return;
         }
-
-        conn.mail({ from: 'verify@yourdomain.com' });
-        conn.rcpt({ to: email }, (err) => {
-          conn.quit();
-          if (!resolved) {
-            resolved = true;
-            if (err) {
-              // console.log(`RCPT TO rejected for ${email} at ${mxHost}:${port} (TLS: ${useTLS}):`, err.message);
-              resolve({ success: false, error: err.message });
+        connection.mail({ from: 'verify@yourdomain.com' });
+        connection.rcpt({ to: email }, (rcptErr) => {
+          connection.quit();
+          if (!done) {
+            done = true;
+            if (rcptErr) {
+              resolve({ success: false, error: rcptErr.message });
             } else {
               resolve({ success: true });
             }
@@ -75,88 +76,157 @@ function smtpVerifySingle(email, mxHost, port, useTLS) {
   });
 }
 
-// Try all MX hosts with multiple ports and TLS options
-async function smtpVerify(email, mxRecords) {
-  for (const mx of mxRecords) {
-    // Try ports in order with TLS first
-    const attempts = [
-      { port: 587, tls: true },
-      { port: 25, tls: false }
-    ];
+async function verifyAllMX(email, mxRecords) {
+  // Try each MX host with ports in order and retries
+  const ports = [
+    { port: 587, tls: true },
+    { port: 465, tls: true, ssl: true }, // will handle ssl manually below
+    { port: 25, tls: false },
+  ];
 
-    for (const attempt of attempts) {
-      const res = await smtpVerifySingle(email, mx.exchange, attempt.port, attempt.tls);
-      if (res.success) return { success: true, mx: mx.exchange, port: attempt.port, tls: attempt.tls };
-      // else continue trying other ports or MX
+  for (const mx of mxRecords) {
+    for (const { port, tls: useTLS, ssl } of ports) {
+      try {
+        if (ssl) {
+          // SMTPS on 465 needs a special connection
+          const result = await smtpVerifySMTPS(email, mx.exchange, port, 10000);
+          if (result.success) return { success: true, mx: mx.exchange, port, tls: useTLS };
+        } else {
+          const result = await smtpVerify(email, mx.exchange, port, useTLS);
+          if (result.success) return { success: true, mx: mx.exchange, port, tls: useTLS };
+        }
+      } catch (e) {
+        // Ignore and try next
+      }
     }
   }
   return { success: false };
 }
 
+// SMTPS on port 465 (SSL) requires different connection setup
+function smtpVerifySMTPS(email, mxHost, port, timeout = 10000) {
+  return new Promise((resolve) => {
+    const socket = tls.connect(port, mxHost, { rejectUnauthorized: false, timeout }, () => {
+      const conn = new SMTPConnection({
+        socket,
+        host: mxHost,
+        port,
+        secure: true,
+        connectionTimeout: timeout,
+        greetingTimeout: timeout,
+        socketTimeout: timeout,
+      });
+
+      let done = false;
+
+      conn.on('error', (err) => {
+        if (!done) {
+          done = true;
+          resolve({ success: false, error: err.message });
+        }
+      });
+
+      conn.connect(() => {
+        conn.login({}, (loginErr) => {
+          if (loginErr) {
+            conn.quit();
+            if (!done) {
+              done = true;
+              resolve({ success: false, error: loginErr.message });
+            }
+            return;
+          }
+          conn.mail({ from: 'verify@yourdomain.com' });
+          conn.rcpt({ to: email }, (rcptErr) => {
+            conn.quit();
+            if (!done) {
+              done = true;
+              if (rcptErr) resolve({ success: false, error: rcptErr.message });
+              else resolve({ success: true });
+            }
+          });
+        });
+      });
+    });
+
+    socket.on('error', (err) => {
+      resolve({ success: false, error: err.message });
+    });
+
+    socket.setTimeout(timeout, () => {
+      socket.destroy();
+      resolve({ success: false, error: 'Timeout' });
+    });
+  });
+}
+
 app.post('/verify', async (req, res) => {
   const emailRaw = req.body.email || '';
   const email = emailRaw.toLowerCase().trim();
+  const skipSMTP = req.query.skip_smtp === 'true';
 
   if (!email) return res.status(400).json({ error: 'email required' });
 
-  if (cache.has(email)) return res.json(cache.get(email));
+  const cacheKey = email + (skipSMTP ? '_skip' : '');
+  if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
 
   const result = {
     email,
     valid_format: false,
     domain_has_mx: false,
-    smtp_valid: false,
+    smtp_valid: null,
     status: 'invalid',
-    confidence_score: 0, // 0-100
+    confidence_score: 0,
     mx_records: [],
     smtp_details: null,
     warnings: [],
   };
 
   result.valid_format = isValidFormat(email);
-
   if (!result.valid_format) {
-    result.warnings.push('Invalid email format.');
-    cache.set(email, result);
+    result.warnings.push('Invalid email format');
+    cache.set(cacheKey, result);
     return res.json(result);
   }
 
   const domain = email.split('@')[1];
-  const mxRecords = await hasMX(domain);
-
+  const mxRecords = await getMXRecords(domain);
   if (mxRecords.length === 0) {
-    result.warnings.push('No MX records found for domain.');
-    cache.set(email, result);
+    result.warnings.push('No MX records found for domain');
+    cache.set(cacheKey, result);
     return res.json(result);
   }
 
   result.domain_has_mx = true;
   result.mx_records = mxRecords.map(mx => mx.exchange);
 
-  const smtpRes = await smtpVerify(email, mxRecords);
-
-  result.smtp_valid = smtpRes.success;
-  result.smtp_details = smtpRes.success
-    ? { verified_on: smtpRes.mx, port: smtpRes.port, tls: smtpRes.tls }
-    : null;
-
-  // Confidence score logic:
-  // Format valid + MX present = 50 points
-  // SMTP verification success = +50 points
-  // If SMTP failed but MX + format good => 75 points and a warning about reliability
-
-  if (result.valid_format) result.confidence_score += 50;
-  if (result.domain_has_mx) result.confidence_score += 25;
-
-  if (result.smtp_valid) {
-    result.confidence_score += 25;
-    result.status = 'valid';
-  } else {
+  if (skipSMTP) {
+    result.smtp_valid = null;
     result.status = 'likely_valid';
-    result.warnings.push('SMTP verification failed or was unreliable.');
+    result.warnings.push('SMTP verification skipped by request');
+    result.confidence_score = 75;
+    cache.set(cacheKey, result);
+    return res.json(result);
   }
 
-  cache.set(email, result);
+  const smtpResult = await verifyAllMX(email, mxRecords);
+
+  result.smtp_valid = smtpResult.success;
+  if (smtpResult.success) {
+    result.status = 'valid';
+    result.confidence_score = 100;
+    result.smtp_details = {
+      mx_host: smtpResult.mx,
+      port: smtpResult.port,
+      tls: smtpResult.tls,
+    };
+  } else {
+    result.status = 'likely_valid';
+    result.confidence_score = 75;
+    result.warnings.push('SMTP verification failed or was unreliable');
+  }
+
+  cache.set(cacheKey, result);
   res.json(result);
 });
 
