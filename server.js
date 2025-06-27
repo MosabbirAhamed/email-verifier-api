@@ -1,14 +1,13 @@
-
 const express = require('express');
 const dns = require('dns').promises;
-const { SMTPConnection } = require('smtp-connection');
+const SMTPConnection = require('smtp-connection');
 const cors = require('cors');
 const LRU = require('lru-cache');
 
 const app = express();
 app.use(cors(), express.json());
 
-const cache = new LRU({ max: 10000, ttl: 1000 * 60 * 60 });
+const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 });
 
 function isValidFormat(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -70,6 +69,6 @@ app.post('/verify', async (req, res) => {
   res.json(result);
 });
 
-app.listen(process.env.PORT || 5000, () => 
+app.listen(process.env.PORT || 5000, () =>
   console.log(`✅ Email verifier running on port ${process.env.PORT || 5000}`)
 );
