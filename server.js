@@ -69,6 +69,7 @@ app.post('/verify', async (req, res) => {
   res.json(result);
 });
 
-app.listen(process.env.PORT || 5000, () =>
-  console.log(`✅ Email verifier running on port ${process.env.PORT || 5000}`)
-);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Email verifier running on port ${PORT}`);
+});
