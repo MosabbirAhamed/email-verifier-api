@@ -7,7 +7,7 @@ const LRU = require('lru-cache');
 const app = express();
 app.use(cors(), express.json());
 
-const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 }); // 1hr cache
+const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 }); // 1 hour cache
 
 function isValidFormat(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -37,7 +37,6 @@ function smtpVerify(email, mxHost, port = 25, useTLS = false, timeout = 8000) {
     connection.on('error', () => resolve({ success: false }));
 
     connection.connect(() => {
-      connection.hello('localhost');
       connection.mail({ from: 'verify@yourdomain.com' });
       connection.rcpt({ to: email }, (err) => {
         connection.quit();
@@ -73,7 +72,7 @@ async function isCatchAll(mxRecords, domain) {
     const result = await verifyAllMX(fakeEmail, mxRecords);
     if (!result.success) return false; // not catch-all
   }
-  return true; // all fake accepted = catch-all
+  return true; // all fake emails accepted → catch-all
 }
 
 app.post('/verify', async (req, res) => {
@@ -109,7 +108,6 @@ app.post('/verify', async (req, res) => {
 
   result.domain_has_mx = true;
 
-  // Check catch-all first
   const isCatch = await isCatchAll(mxRecords, domain);
   result.is_catch_all = isCatch;
 
@@ -121,7 +119,6 @@ app.post('/verify', async (req, res) => {
     return res.json(result);
   }
 
-  // Try SMTP for real mailbox
   const smtpRes = await verifyAllMX(email, mxRecords);
   result.smtp_valid = smtpRes.success;
 
@@ -131,14 +128,14 @@ app.post('/verify', async (req, res) => {
   } else {
     result.status = 'likely_valid';
     result.confidence_score = 75;
-    result.warnings.push('SMTP server did not confirm mailbox (could be greylisted or blocked)');
+    result.warnings.push('SMTP server did not confirm mailbox (could be greylisted, blocked, or deferred)');
   }
 
   cache.set(email, result);
   res.json(result);
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Email verifier running on port ${PORT}`);
 });
