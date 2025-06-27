@@ -1,7 +1,7 @@
 {
   "name": "email-verifier-api",
   "version": "1.0.0",
-  "description": "Email verifier API with SMTP support and STARTTLS",
+  "description": "Free email verifier API with SMTP and catch-all detection",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
