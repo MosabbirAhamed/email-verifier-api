@@ -163,23 +163,3 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Email verifier running on port ${PORT}`);
 });
-🔁 Don’t forget package.json
-If you need it again:
-
-json
-Copy
-Edit
-{
-  "name": "email-verifier-api",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "lru-cache": "^6.0.0",
-    "smtp-connection": "2.12.0"
-  }
-}
