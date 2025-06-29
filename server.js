@@ -5,9 +5,18 @@ const cors = require('cors');
 const LRU = require('lru-cache');
 
 const app = express();
-app.use(cors(), express.json());
 
-const cache = new LRU({ max: 10000, ttl: 1000 * 60 * 60 });
+// ✅ Fix CORS for Netlify or any public frontend
+const corsOptions = {
+  origin: '*', // Or specify: 'https://your-site.netlify.app'
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+};
+app.use(cors(corsOptions));
+app.use(express.json());
+
+// ✅ Cache responses to avoid rechecking same emails
+const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 }); // 1 hour
 
 function isValidFormat(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -17,7 +26,7 @@ async function getMXRecords(domain) {
   try {
     const mxRecords = await dns.resolveMx(domain);
     return mxRecords.sort((a, b) => a.priority - b.priority);
-  } catch {
+  } catch (err) {
     return [];
   }
 }
@@ -34,32 +43,13 @@ function smtpVerify(email, mxHost, port = 25, useTLS = false, timeout = 8000) {
       socketTimeout: timeout,
     });
 
-    const result = {
-      success: false,
-      code: null,
-      message: '',
-      mxHost,
-      port,
-      tls: !!useTLS
-    };
-
-    connection.on('error', (err) => {
-      result.message = err?.message || 'Connection error';
-      resolve(result);
-    });
+    connection.on('error', () => resolve({ success: false }));
 
     connection.connect(() => {
       connection.mail({ from: 'verify@yourdomain.com' });
       connection.rcpt({ to: email }, (err) => {
-        if (err) {
-          result.code = err.code || 550;
-          result.message = err.message || 'Recipient rejected';
-        } else {
-          result.success = true;
-          result.message = 'Accepted';
-        }
         connection.quit();
-        resolve(result);
+        resolve({ success: !err });
       });
     });
   });
@@ -74,22 +64,23 @@ async function verifyAllMX(email, mxRecords) {
 
     for (const { port, tls } of ports) {
       const result = await smtpVerify(email, mx.exchange, port, tls);
-      if (result.success) return result;
+      if (result.success) {
+        return { success: true, mx: mx.exchange, port, tls };
+      }
     }
   }
-  return { success: false, message: 'All attempts failed' };
+  return { success: false };
 }
 
 async function isCatchAll(mxRecords, domain) {
-  const fakeEmails = Array.from({ length: 2 }).map(
+  const randomEmails = Array.from({ length: 2 }).map(
     (_, i) => `nonexist${Date.now()}${i}@${domain}`
   );
 
-  for (const fake of fakeEmails) {
-    const res = await verifyAllMX(fake, mxRecords);
-    if (!res.success) return false;
+  for (const fakeEmail of randomEmails) {
+    const result = await verifyAllMX(fakeEmail, mxRecords);
+    if (!result.success) return false;
   }
-
   return true;
 }
 
@@ -105,10 +96,9 @@ app.post('/verify', async (req, res) => {
     domain_has_mx: false,
     smtp_valid: false,
     is_catch_all: false,
-    smtp_debug: null,
     status: 'invalid',
-    confidence_score: 0,
-    warnings: []
+    warnings: [],
+    confidence_score: 0
   };
 
   result.valid_format = isValidFormat(email);
@@ -127,9 +117,10 @@ app.post('/verify', async (req, res) => {
 
   result.domain_has_mx = true;
 
-  const catchAll = await isCatchAll(mxRecords, domain);
-  result.is_catch_all = catchAll;
-  if (catchAll) {
+  const isCatch = await isCatchAll(mxRecords, domain);
+  result.is_catch_all = isCatch;
+
+  if (isCatch) {
     result.status = 'unknown';
     result.confidence_score = 50;
     result.warnings.push('Catch-all domain — mailbox existence cannot be verified');
@@ -138,16 +129,15 @@ app.post('/verify', async (req, res) => {
   }
 
   const smtpRes = await verifyAllMX(email, mxRecords);
-  result.smtp_debug = smtpRes;
   result.smtp_valid = smtpRes.success;
 
   if (smtpRes.success) {
     result.status = 'valid';
     result.confidence_score = 100;
   } else {
-    result.status = 'likely_invalid';
-    result.confidence_score = 40;
-    result.warnings.push(smtpRes.message || 'SMTP check failed');
+    result.status = 'likely_valid';
+    result.confidence_score = 75;
+    result.warnings.push('SMTP server did not confirm mailbox (could be greylisted, blocked, or deferred)');
   }
 
   cache.set(email, result);
