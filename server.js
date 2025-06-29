@@ -6,16 +6,16 @@ const LRU = require('lru-cache');
 
 const app = express();
 
-// ✅ Fix CORS for Netlify or any public frontend
-const corsOptions = {
-  origin: '*', // Or specify: 'https://your-site.netlify.app'
+// ✅ CORS support for all public domains (like Netlify)
+app.use(cors({
+  origin: '*',
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type']
-};
-app.use(cors(corsOptions));
+}));
+
 app.use(express.json());
 
-// ✅ Cache responses to avoid rechecking same emails
+// ✅ Email result cache (in memory)
 const cache = new LRU({ max: 10000, maxAge: 1000 * 60 * 60 }); // 1 hour
 
 function isValidFormat(email) {
@@ -31,6 +31,7 @@ async function getMXRecords(domain) {
   }
 }
 
+// ✅ Stable SMTP check function (no crash if error)
 function smtpVerify(email, mxHost, port = 25, useTLS = false, timeout = 8000) {
   return new Promise((resolve) => {
     const connection = new SMTPConnection({
@@ -43,25 +44,36 @@ function smtpVerify(email, mxHost, port = 25, useTLS = false, timeout = 8000) {
       socketTimeout: timeout,
     });
 
-    connection.on('error', () => resolve({ success: false }));
+    let resolved = false;
+
+    connection.on('error', () => {
+      if (!resolved) {
+        resolved = true;
+        resolve({ success: false });
+      }
+    });
 
     connection.connect(() => {
-      connection.mail({ from: 'verify@yourdomain.com' });
-      connection.rcpt({ to: email }, (err) => {
-        connection.quit();
-        resolve({ success: !err });
+      connection.mail({ from: 'verify@yourdomain.com' }, () => {
+        connection.rcpt({ to: email }, (err) => {
+          connection.quit();
+          if (!resolved) {
+            resolved = true;
+            resolve({ success: !err });
+          }
+        });
       });
     });
   });
 }
 
+// ✅ Try each MX record and port combo (587 w/ TLS and 25 plain)
 async function verifyAllMX(email, mxRecords) {
   for (const mx of mxRecords) {
     const ports = [
       { port: 587, tls: true },
       { port: 25, tls: false }
     ];
-
     for (const { port, tls } of ports) {
       const result = await smtpVerify(email, mx.exchange, port, tls);
       if (result.success) {
@@ -72,11 +84,11 @@ async function verifyAllMX(email, mxRecords) {
   return { success: false };
 }
 
+// ✅ Check if domain accepts all emails (catch-all)
 async function isCatchAll(mxRecords, domain) {
   const randomEmails = Array.from({ length: 2 }).map(
     (_, i) => `nonexist${Date.now()}${i}@${domain}`
   );
-
   for (const fakeEmail of randomEmails) {
     const result = await verifyAllMX(fakeEmail, mxRecords);
     if (!result.success) return false;
@@ -84,10 +96,12 @@ async function isCatchAll(mxRecords, domain) {
   return true;
 }
 
+// ✅ Main verification route
 app.post('/verify', async (req, res) => {
   const email = (req.body.email || '').toLowerCase().trim();
-  if (!email) return res.status(400).json({ error: 'Email is required' });
+  res.setHeader('Content-Type', 'application/json');
 
+  if (!email) return res.status(400).json({ error: 'Email is required' });
   if (cache.has(email)) return res.json(cache.get(email));
 
   const result = {
@@ -144,7 +158,28 @@ app.post('/verify', async (req, res) => {
   res.json(result);
 });
 
+// ✅ Start server (Railway uses PORT or defaults to 8080)
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Email verifier running on port ${PORT}`);
 });
+🔁 Don’t forget package.json
+If you need it again:
+
+json
+Copy
+Edit
+{
+  "name": "email-verifier-api",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "lru-cache": "^6.0.0",
+    "smtp-connection": "2.12.0"
+  }
+}
